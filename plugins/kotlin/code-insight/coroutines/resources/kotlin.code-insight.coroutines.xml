@@ -1,0 +1,10 @@
+<idea-plugin package="org.jetbrains.kotlin.idea.coroutines.counter">
+<extensions defaultExtensionNs="com.intellij">
+  <postStartupActivity implementation="org.jetbrains.kotlin.idea.coroutines.counter.CoroutinesCounterPostStartupActivity"/>
+
+  <notificationGroup id="Kotlin Coroutines Counter Notification Group"
+                     displayType="BALLOON"/>
+
+  <codeInsight.lineMarkerProvider language="kotlin" implementationClass="org.jetbrains.kotlin.idea.coroutines.counter.CoroutinesCounterLineMarkerProvider"/>
+</extensions>
+</idea-plugin>
