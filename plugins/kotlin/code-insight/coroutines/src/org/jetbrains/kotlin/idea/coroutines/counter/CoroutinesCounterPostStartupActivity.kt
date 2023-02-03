@@ -75,7 +75,7 @@ class CoroutinesCounterPostStartupActivity : ProjectPostStartupActivity {
         val searcher = CoroutinesSearcher(project, indicator)
 
         var current = 0
-        var total = modulesUsesCoroutines.size.toDouble()
+        val total = modulesUsesCoroutines.size.toDouble()
 
         val exceptionHandler = CoroutineExceptionHandler { _, exception ->
             if (exception !is ProcessCanceledException) {
@@ -83,7 +83,7 @@ class CoroutinesCounterPostStartupActivity : ProjectPostStartupActivity {
             }
         }
 
-        val jobs = modulesUsesCoroutines.map { module ->
+        val collectDirectCoroutinesLaunchesJobs = modulesUsesCoroutines.map { module ->
             GlobalScope.launch(exceptionHandler) {
                 val kotlinSources = ModuleRootManager.getInstance(module).getKotlinSources()
 
@@ -94,7 +94,27 @@ class CoroutinesCounterPostStartupActivity : ProjectPostStartupActivity {
                 }
 
                 psiFiles.forEach { psiFile ->
-                    searcher.visit(psiFile)
+                    searcher.collectDirectCoroutinesLaunches(psiFile)
+                }
+            }
+        }
+
+        runBlocking {
+            collectDirectCoroutinesLaunchesJobs.joinAll()
+        }
+
+        val collectIndirectCoroutinesLaunchesJobs = modulesUsesCoroutines.map { module ->
+            GlobalScope.launch(exceptionHandler) {
+                val kotlinSources = ModuleRootManager.getInstance(module).getKotlinSources()
+
+                val psiFiles = project.runReadActionInSmartMode {
+                    kotlinSources.mapNotNull { source ->
+                        PsiManager.getInstance(project).findFile(source)
+                    }
+                }
+
+                psiFiles.forEach { psiFile ->
+                    searcher.collectIndirectCoroutinesLaunches(psiFile)
                 }
 
                 ++current
@@ -105,8 +125,8 @@ class CoroutinesCounterPostStartupActivity : ProjectPostStartupActivity {
             }
         }
 
-      runBlocking {
-          jobs.joinAll()
-      }
+        runBlocking {
+            collectIndirectCoroutinesLaunchesJobs.joinAll()
+        }
     }
 }

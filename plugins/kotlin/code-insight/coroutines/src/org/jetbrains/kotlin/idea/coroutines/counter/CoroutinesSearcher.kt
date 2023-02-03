@@ -38,77 +38,96 @@ class CoroutinesSearcher(private val project: Project, private val indicator: Pr
         const val UNKNOWN_TAG = -1
         const val INFINITY_TAG = -2
 
-        private val mainCache = mutableMapOf<PsiElement, Int>()
+        val mainCache = mutableMapOf<PsiElement, Int>()
+        private fun increaseCountForFunction(function: PsiElement, addend: Int) {
+            if (addend < 0) {
+                throw InvalidArgument()
+            }
+
+            val knownCount = mainCache.getOrDefault(function, 0)
+
+            mainCache[function] = if (addend > Int.MAX_VALUE - knownCount) INFINITY_TAG else knownCount + addend
+        }
 
         fun coroutinesCountFor(f: PsiElement): Int? {
             return mainCache[f]
         }
     }
 
-    fun visit(psiFile: PsiFile) {
-        val cache = mutableMapOf<PsiElement, Int>()
-
-        fun increaseCountForFunction(function: PsiElement, addend: Int) {
-            if (addend < 0) {
-                throw InvalidArgument()
-            }
-
-            val knownCount = cache.getOrDefault(function, 0)
-            val sum = knownCount + addend
-
-            if (sum < knownCount) {
-                cache[function] = INFINITY_TAG
-                return
-            }
-
-            cache[function] = sum
-        }
-
-        val nestedCallsCache = mutableMapOf<PsiElement, MutableList<PsiElement>>()
-
+    fun collectDirectCoroutinesLaunches(psiFile: PsiFile) {
         val functions = project.runReadActionInSmartMode { psiFile.collectDescendantsOfType<KtNamedFunction>() }
 
         functions.forEach { function ->
             indicator.checkCanceled()
 
-            val nestedCalls = project.runReadActionInSmartMode { function.collectDescendantsOfType<KtCallExpression>() }
-
-            if (nestedCalls.isEmpty()) {
-                nestedCallsCache[function] = mutableListOf()
+            if (mainCache.containsKey(function)) {
                 return@forEach
             }
 
-            nestedCalls.forEach { callExpression ->
+            val calls = project.runReadActionInSmartMode { function.collectDescendantsOfType<KtCallExpression>() }
+
+            calls.forEach { call ->
                 indicator.checkCanceled()
 
-                val callReference = callExpression.referenceExpression() ?: return
+                val callReference = call.referenceExpression() ?: return@forEach
                 val isCoroutineLaunch = project.runReadActionInSmartMode { callReference.isCoroutineLaunch() }
 
                 if (isCoroutineLaunch) {
                     increaseCountForFunction(function, 1)
-                } else {
+                }
+            }
+        }
+    }
+
+    fun collectIndirectCoroutinesLaunches(psiFile: PsiFile) {
+        val nestedCallsCache = mutableMapOf<PsiElement, MutableList<PsiElement>>()
+
+        val localFunctions = project.runReadActionInSmartMode { psiFile.collectDescendantsOfType<KtNamedFunction>() }
+
+        localFunctions.forEach { function ->
+            indicator.checkCanceled()
+
+            val calls = project.runReadActionInSmartMode { function.collectDescendantsOfType<KtCallExpression>() }
+
+            if (calls.isEmpty()) {
+                nestedCallsCache[function] = mutableListOf()
+                return@forEach
+            }
+
+            calls.forEach { call ->
+                indicator.checkCanceled()
+
+                val callReference = call.referenceExpression() ?: return@forEach
+                val isCoroutineLaunch = project.runReadActionInSmartMode { callReference.isCoroutineLaunch() }
+
+                if (!isCoroutineLaunch) {
                     val callReferenceAsPsi = callReference as PsiElement
                     val seen = callReferenceAsPsi.getUserData(SEEN_KEY)
 
                     if (seen == null) {
+                        val cachedSeen = CachedValue(project) {
+                            CachedValueProvider.Result.create(true, ModificationTracker.NEVER_CHANGED)
+                        }
+
+                        callReferenceAsPsi.putUserData(SEEN_KEY, cachedSeen)
+
                         val resolvedPsiElement = project.runReadActionInSmartMode {
                             callReferenceAsPsi.reference?.resolve()
+                        }
+
+                        if (!mainCache.containsKey(resolvedPsiElement)) {
+                            return@forEach
                         }
 
                         val cachedResolved = CachedValue(project, true) {
                             CachedValueProvider.Result.create(resolvedPsiElement, callReferenceAsPsi)
                         }
 
-                        val cachedSeen = CachedValue(project) {
-                            CachedValueProvider.Result.create(true, ModificationTracker.NEVER_CHANGED)
-                        }
-
-                        callReferenceAsPsi.putUserData(SEEN_KEY, cachedSeen)
                         callReferenceAsPsi.putUserData(RESOLVED_KEY, cachedResolved)
                     }
 
                     val cachedResolved = callReferenceAsPsi.getUserData(RESOLVED_KEY)
-                    val resolvedPsiElement = project.runReadActionInSmartMode { cachedResolved?.value } ?: return
+                    val resolvedPsiElement = project.runReadActionInSmartMode { cachedResolved?.value } ?: return@forEach
 
                     val nestedCalls = nestedCallsCache.getOrDefault(function, mutableListOf())
                     nestedCalls.add(resolvedPsiElement)
@@ -117,38 +136,38 @@ class CoroutinesSearcher(private val project: Project, private val indicator: Pr
             }
         }
 
-        val independent = cache.keys.subtract(nestedCallsCache.keys)
+        val independent = localFunctions.subtract(nestedCallsCache.keys)
         independent.forEach {
             nestedCallsCache[it] = mutableListOf()
         }
 
         try {
-            resolveFunctionsOrder(nestedCallsCache)
+            resolveFunctionsOrder(nestedCallsCache, localFunctions)
 
             nestedCallsCache.forEach { (function, calledFunctions) ->
                 calledFunctions.forEach { declaration ->
-                    val addend = cache[declaration] ?: return@forEach
+                    val addend = mainCache[declaration] ?: return@forEach
                     increaseCountForFunction(function, addend)
                 }
             }
-        } catch (err: CircularDependencyError) {
-            cache.keys.forEach { function ->
-                cache[function] = UNKNOWN_TAG
+        } catch (_: CircularDependencyError) {
+            nestedCallsCache.forEach { (function) ->
+                mainCache[function] = UNKNOWN_TAG
             }
         }
 
         nestedCallsCache.clear()
-
-        cache.forEach { entry ->
-            mainCache[entry.key] = entry.value
-        }
     }
 
-    private fun resolveFunctionsOrder(cache: MutableMap<PsiElement, MutableList<PsiElement>>) {
+    private fun resolveFunctionsOrder(cache: MutableMap<PsiElement, MutableList<PsiElement>>, localFunctions: List<KtNamedFunction>) {
         indicator.checkCanceled()
 
         val ordered = mutableSetOf<PsiElement>()
         val nestedCallsCacheCopy = cache.toMutableMap()
+
+        nestedCallsCacheCopy.forEach { (function, calledFunctions) ->
+            nestedCallsCacheCopy[function] = calledFunctions.intersect(localFunctions.toSet()).toMutableList()
+        }
 
         while (nestedCallsCacheCopy.isNotEmpty()) {
             val ready = mutableSetOf<PsiElement>()
