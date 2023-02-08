@@ -98,5 +98,6 @@
     <module name="kotlin.code-insight.live-templates-k1"/>
     <module name="kotlin.code-insight.postfix-templates-k1"/>
     <module name="kotlin.code-insight.structural-search-k1"/>
+    <module name="kotlin.code-insight.coroutines"/>
   </content>
 </idea-plugin>
